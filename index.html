@@ -929,8 +929,49 @@ function gameLoop(ts){
   if(gameTime>=GAME_DURATION){endGame();return}
   requestAnimationFrame(gameLoop);
 }
-function getRanking(){try{return JSON.parse(localStorage.getItem('partsRushRanking')||'[]')}catch(e){return[]}}
-function saveRanking(d){try{localStorage.setItem('partsRushRanking',JSON.stringify(d))}catch(e){}}
+// === FIREBASE REALTIME DATABASE ===
+var FB_URL='https://parts-rush-bra-default-rtdb.firebaseio.com';
+var _fbRankingCache=[];
+var _fbListenerActive=false;
+
+function fbGet(path,cb){
+  fetch(FB_URL+path+'.json').then(function(r){return r.json()}).then(function(d){cb(null,d)}).catch(function(e){cb(e,null)});
+}
+function fbPush(path,data,cb){
+  fetch(FB_URL+path+'.json',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
+    .then(function(r){return r.json()}).then(function(d){if(cb)cb(null,d)}).catch(function(e){if(cb)cb(e,null)});
+}
+function fbDelete(path,cb){
+  fetch(FB_URL+path+'.json',{method:'DELETE'}).then(function(){if(cb)cb(null)}).catch(function(e){if(cb)cb(e)});
+}
+
+// Inicia listener SSE para atualizações em tempo real no leaderboard
+function startFbListener(){
+  if(_fbListenerActive)return;
+  _fbListenerActive=true;
+  try{
+    var es=new EventSource(FB_URL+'/ranking.json');
+    es.addEventListener('put',function(e){
+      try{
+        var d=JSON.parse(e.data);
+        var raw=d.data;
+        _fbRankingCache=raw?Object.values(raw):[];
+        // Atualiza leaderboard se visível
+        if(leaderboardSection&&leaderboardSection.classList.contains('show')){
+          renderLeaderboard(currentEntryId);
+        }
+        // Atualiza painel admin se aberto
+        if(adminScreen&&adminScreen.classList.contains('show')){
+          refreshAdmin();
+        }
+      }catch(err){}
+    });
+    es.onerror=function(){_fbListenerActive=false;es.close()};
+  }catch(err){_fbListenerActive=false}
+}
+
+function getRanking(){return _fbRankingCache.slice()}
+function saveRanking(d){/* Firebase: escrita é feita via fbPush/fbDelete individualmente */}
 
 // === MÉTRICAS DE ENGAJAMENTO ===
 // Registra TODA sessão jogada, mesmo sem preencher form
@@ -1034,7 +1075,10 @@ function refreshAdmin(){
   }
   adminPreview.textContent=txt;
 }
-function openAdmin(){refreshAdmin();switchTab('leads');adminScreen.classList.add('show')}
+function openAdmin(){
+  fbGet('/ranking',function(err,raw){if(!err&&raw){_fbRankingCache=Object.values(raw);}else if(!raw){_fbRankingCache=[];}refreshAdmin();});
+  switchTab('leads');adminScreen.classList.add('show');
+}
 function closeAdmin(){adminScreen.classList.remove('show')}
 exportCsvBtn.addEventListener('click',function(){
   var data=getRanking();if(data.length===0){showToast('Sem dados');return}
@@ -1076,7 +1120,7 @@ clearDataBtn.addEventListener('click',function(){
   var data=getRanking();
   if(data.length===0){showToast('Sem dados');return}
   if(confirm('Apagar TODOS os '+data.length+' registros? Esta a\u00e7\u00e3o n\u00e3o pode ser desfeita. Recomendamos exportar antes.')){
-    saveRanking([]);refreshAdmin();showToast('Dados apagados.');
+    fbDelete('/ranking',function(){_fbRankingCache=[];localStorage.removeItem('partsRushRanking');refreshAdmin();showToast('Dados apagados.');});
   }
 });
 adminCloseBtn.addEventListener('click',closeAdmin);
@@ -1172,15 +1216,20 @@ if(attractLogoEl){
   attractLogoEl.style.cursor='pointer';
 }
 function escHtml(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML}
-function renderLeaderboard(hlId){
-  var data=getRanking().sort(function(a,b){return b.score-a.score}).slice(0,10);lbBody.innerHTML='';
+function _renderLeaderboardData(data,hlId){
+  data=data.sort(function(a,b){return b.score-a.score}).slice(0,10);lbBody.innerHTML='';
   var playerRank=-1;
   for(var i=0;i<data.length;i++){var e=data[i],tr=document.createElement('tr');if(e.id===hlId){tr.className='lb-highlight';playerRank=i}var m=i<3?medals[i]:(i+1);tr.innerHTML='<td class="lb-rank">'+m+'</td><td>'+escHtml(e.nome)+'</td><td>'+escHtml(e.empresa)+'</td><td class="lb-score-col">'+e.score+'</td>';lbBody.appendChild(tr)}
   leaderboardSection.classList.add('show');
-  // Confete se entrou no TOP 3
-  if(playerRank>=0&&playerRank<3){
-    setTimeout(function(){launchConfetti(playerRank)},250);
-  }
+  if(playerRank>=0&&playerRank<3){setTimeout(function(){launchConfetti(playerRank)},250);}
+}
+function renderLeaderboard(hlId){
+  // Busca dados frescos do Firebase
+  fbGet('/ranking',function(err,raw){
+    if(!err&&raw){_fbRankingCache=Object.values(raw);}
+    _renderLeaderboardData(_fbRankingCache,hlId);
+  });
+  startFbListener();
 }
 
 // Sistema de confete (canvas overlay)
@@ -1248,12 +1297,24 @@ function doSubmitRank(){
   if(email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){inputEmail.focus();inputEmail.style.borderColor='#ff5555';setTimeout(function(){inputEmail.style.borderColor=''},2000);return}
   var id=Date.now()+'_'+Math.random().toString(36).substr(2,6);currentEntryId=id;
   var entry={id:id,nome:nome,empresa:empresa||'-',email:email,score:score,timestamp:new Date().toISOString(),consent:true,marketingOptIn:marketingCheck.checked};
-  var data=getRanking();data.push(entry);
-  saveRanking(data);
-  // Atualizar última métrica para marcar que houve captura de lead
-  var mList=getMetrics();
-  if(mList.length>0){mList[mList.length-1].leadCaptured=true;mList[mList.length-1].leadEmail=email;saveMetrics(mList);}
-  rankForm.style.display='none';renderLeaderboard(id);
+  // Salva no Firebase em tempo real
+  submitRank.disabled=true;submitRank.textContent='SALVANDO...';
+  fbPush('/ranking',entry,function(err){
+    submitRank.disabled=false;submitRank.textContent='REGISTRAR';
+    if(err){
+      // Fallback localStorage se Firebase falhar
+      var bkp=JSON.parse(localStorage.getItem('partsRushRanking')||'[]');
+      bkp.push(entry);localStorage.setItem('partsRushRanking',JSON.stringify(bkp));
+      _fbRankingCache=bkp;
+    } else {
+      _fbRankingCache.push(entry);
+    }
+    // Atualizar última métrica para marcar que houve captura de lead
+    var mList=getMetrics();
+    if(mList.length>0){mList[mList.length-1].leadCaptured=true;mList[mList.length-1].leadEmail=email;saveMetrics(mList);}
+    rankForm.style.display='none';renderLeaderboard(id);
+    startFbListener();
+  });
 }
 submitRank.addEventListener('click',doSubmitRank);
 submitRank.addEventListener('touchend',function(e){e.preventDefault();doSubmitRank()});
@@ -1312,7 +1373,7 @@ function endGame(){
   hudEl.classList.remove('show');uptimeBarWrap.classList.remove('show');uptimeLbl.classList.remove('show');
   goScoreDisplay.textContent=score+' pe\u00E7as capturadas';
   rankForm.style.display='block';inputNome.value='';inputEmpresa.value='';inputEmail.value='';consentCheck.checked=false;marketingCheck.checked=false;submitRank.disabled=true;
-  leaderboardSection.classList.remove('show');var existing=getRanking();if(existing.length>0)renderLeaderboard(null);
+  leaderboardSection.classList.remove('show');fbGet('/ranking',function(err,raw){if(!err&&raw){_fbRankingCache=Object.values(raw);}if(_fbRankingCache.length>0){_renderLeaderboardData(_fbRankingCache,null);}startFbListener();});
   setTimeout(function(){gameOverScreen.style.display='flex';gameOverScreen.scrollTop=0;setTimeout(function(){gameOverScreen.classList.add('show')},50)},400);
 }
 function restartGame(){gameOverScreen.classList.remove('show');setTimeout(function(){gameOverScreen.style.display='none';startCountdown()},400)}
